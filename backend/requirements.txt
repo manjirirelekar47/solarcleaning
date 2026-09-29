@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy>=2
+psycopg[binary]
+paho-mqtt>=2
+pydantic-settings
+httpx
+python-multipart
+pillow
+pytest
+ruff
+black
