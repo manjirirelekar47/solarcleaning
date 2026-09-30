@@ -1,0 +1,5 @@
+# Only needed for training (ml/train.py) and for serving the trained CNN.
+# Without these, the API falls back to the brightness-heuristic stub classifier.
+torch
+torchvision
+scikit-learn
