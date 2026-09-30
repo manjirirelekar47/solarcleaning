@@ -1,6 +1,6 @@
 import io
 
-from app.models import CleaningCycle, PanelReading, SoilingEvent
+from app.models import Alert, CleaningCycle, PanelReading, SoilingEvent
 from PIL import Image
 
 
@@ -56,7 +56,15 @@ def test_status_reflects_event_and_env(client, db):
     db.commit()
     s = client.get("/status").json()
     assert s["event"]["level"] == "clean_recommended" and s["env"]["temp"] == 30
-    assert client.get("/alerts").json()[0]["level"] == "clean_recommended"
+    assert client.get("/alerts").json() == []  # A9: an event is not an alert, only transitions are
+    db.add(Alert(kind="level_change", level="clean_recommended", message="level changed"))
+    db.commit()
+    row = client.get("/alerts").json()[0]
+    assert (row["kind"], row["level"], row["message"]) == (
+        "level_change",
+        "clean_recommended",
+        "level changed",
+    )
 
 
 def test_manual_clean_blocked_while_cycle_active(client, db, monkeypatch):

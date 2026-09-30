@@ -14,7 +14,7 @@ from . import mqtt_client
 from .config import settings
 from .db import get_db
 from .decision_engine import active_cycle, current_electrical_loss, trigger_clean
-from .models import CleaningCycle, ImageCapture, PanelReading, SoilingEvent
+from .models import Alert, CleaningCycle, ImageCapture, PanelReading, SoilingEvent
 from .vision import load_classifier
 
 router = APIRouter()
@@ -43,6 +43,8 @@ def _cycle(c):
         "result": c.result,
         "pre": c.pre_loss,
         "post": c.post_loss,
+        "attempt": c.attempt,
+        "post_image_id": c.post_image_id,
         "triggered_at": c.triggered_at,
         "completed_at": c.completed_at,
     }
@@ -106,16 +108,13 @@ def events(limit: int = 200, db: Session = Depends(get_db)):
 
 @router.get("/alerts")
 def alerts(limit: int = 20, db: Session = Depends(get_db)):
-    rows = db.scalars(
-        select(SoilingEvent)
-        .where(SoilingEvent.alert_level != "ok")
-        .order_by(SoilingEvent.timestamp.desc())
-        .limit(limit)
-    ).all()
+    """A9: one row per transition (same text as the Telegram message), newest first."""
+    rows = db.scalars(select(Alert).order_by(Alert.id.desc()).limit(limit)).all()
     return [
-        {"t": r.timestamp, "level": r.alert_level, "loss": r.combined_loss, "action": r.action}
+        {"t": r.timestamp, "kind": r.kind, "level": r.level, "message": r.message,
+         "cycle_id": r.cycle_id}
         for r in rows
-    ]
+    ]  # fmt: skip
 
 
 @router.get("/cleaning-cycles")
@@ -165,5 +164,5 @@ async def upload_image(file: UploadFile, db: Session = Depends(get_db)):
 def manual_clean(db: Session = Depends(get_db)):
     if active_cycle(db):
         raise HTTPException(status_code=409, detail="A cleaning cycle is already in progress")
-    cyc = trigger_clean(db, mqtt_client.client, current_electrical_loss(db) or 0.0)
+    cyc = trigger_clean(db, mqtt_client.client, current_electrical_loss(db) or 0.0, attempt=1)
     return {"ok": True, "cycle_id": cyc.id}

@@ -1,9 +1,11 @@
-"""MQTT ingestion: sensors/* -> panel_readings, cleaning/status -> cleaning_cycles."""
+"""MQTT ingestion: sensors/* -> readings + device_state, cleaning/status -> cleaning_cycles."""
 
 import json
 
 import paho.mqtt.client as mqtt
 
+from . import health
+from .alerts import record_alert
 from .config import settings
 from .db import SessionLocal
 from .models import CleaningCycle, PanelReading, now
@@ -20,23 +22,42 @@ def on_message(c, userdata, msg):
         p = json.loads(msg.payload)
         with SessionLocal() as db:
             if msg.topic in ("sensors/test", "sensors/reference"):
+                source = msg.topic.split("/")[1]
                 amps = p["i_ma"] / 1000
-                db.add(
-                    PanelReading(
-                        panel_type=msg.topic.split("/")[1],
-                        voltage=p["v"],
-                        current=amps,
-                        power=p["v"] * amps,
-                        temp=p.get("temp"),
-                        humidity=p.get("hum"),
+                fault = health.check_reading(p["v"], amps)
+                health.touch(db, source, fault)
+                if fault is None:  # implausible readings never reach the loss calculation
+                    db.add(
+                        PanelReading(
+                            panel_type=source,
+                            voltage=p["v"],
+                            current=amps,
+                            power=p["v"] * amps,
+                            temp=p.get("temp"),
+                            humidity=p.get("hum"),
+                        )
                     )
-                )
+            elif msg.topic == "sensors/fault":  # firmware: INA219 missing etc.
+                if p["source"] in health.SOURCES:
+                    health.touch(db, p["source"], str(p.get("fault", "sensor fault")))
             elif msg.topic == "cleaning/status":
                 cyc = db.get(CleaningCycle, p["cycle_id"])
-                if cyc and p["state"] == "running":
-                    cyc.status = "running"
-                elif cyc and p["state"] == "done":
-                    cyc.status, cyc.completed_at = "verifying", now()
+                if cyc and cyc.status != "complete":  # a late message must not revive a cycle
+                    if p["state"] == "running":
+                        cyc.status = "running"
+                    elif p["state"] == "done":
+                        cyc.status, cyc.completed_at = "verifying", now()
+                    elif p["state"] == "rejected":  # device refused the trigger (busy/bad payload)
+                        cyc.status, cyc.result, cyc.completed_at = "complete", "failed", now()
+                        db.commit()
+                        record_alert(
+                            db,
+                            "cleaning",
+                            "inspection",
+                            f"Cleaning #{cyc.id} rejected by the device (busy or bad payload). "
+                            "Manual inspection needed.",
+                            cycle_id=cyc.id,
+                        )
             db.commit()
     except Exception as e:  # never let a bad payload kill the network loop
         print("MQTT handler error:", e)
