@@ -1,0 +1,17 @@
+# Override file that locks down MQTT and passes the API key to the backend.
+# Run from the repo root, next to your existing docker-compose.yml:
+#   docker compose -f docker-compose.yml -f infra/docker-compose.secure.yml up -d
+# Service names below (mosquitto, backend) must match your base compose file.
+services:
+  mosquitto:
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/passwd:/mosquitto/config/passwd:ro
+  backend:
+    environment:
+      API_KEY: ${API_KEY:?set API_KEY in .env}
+      MQTT_USER: ${MQTT_USER:-backend}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+      WEATHER_LAT: ${WEATHER_LAT:?set WEATHER_LAT in .env}
+      WEATHER_LON: ${WEATHER_LON:?set WEATHER_LON in .env}
+      MIN_CONF: ${MIN_CONF:-0.6}
