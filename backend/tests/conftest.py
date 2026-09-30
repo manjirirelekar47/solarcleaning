@@ -8,6 +8,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 
+@pytest.fixture(autouse=True)
+def no_debounce_by_default(monkeypatch):
+    """Existing tests expect an immediate clean; A4 tests set confirm_n explicitly."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "confirm_n", 1)
+
+
 @pytest.fixture()
 def session_factory():
     engine = create_engine(

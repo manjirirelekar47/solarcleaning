@@ -99,7 +99,7 @@ export default function App() {
         <ul>
           {alerts.map((a, i) => (
             <li key={i}>
-              {new Date(a.t).toLocaleTimeString()} · {a.level} · {a.loss.toFixed(1)}% · {a.action}
+              {new Date(a.t).toLocaleTimeString()} · {a.kind} · {a.level} · {a.message}
             </li>
           ))}
         </ul>

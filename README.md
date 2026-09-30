@@ -25,7 +25,7 @@ Optional: `curl -F file=@panel.jpg localhost:8000/images` to feed the image clas
 ## Tests and code style
 
 ```bash
-pytest            # decision engine, API, MQTT ingestion, vision stub
+pytest            # decision engine, debounce, lifecycle + alerts, loss maths, API, MQTT, vision
 ruff check . && black --check .
 ```
 CI (`.github/workflows/ci.yml`) runs the same checks plus a dashboard build on every PR.

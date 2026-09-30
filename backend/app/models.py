@@ -1,8 +1,8 @@
-"""ORM tables: panel_readings, image_captures, soiling_events, cleaning_cycles."""
+"""ORM tables: readings, images, soiling events, cleaning cycles, alerts, device state."""
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import Boolean, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -41,18 +41,23 @@ class ImageCapture(Base):
     image_path: Mapped[str]
     soiling_class: Mapped[str]
     confidence: Mapped[float]
-    severity_score: Mapped[float]  # 0-100
+    severity_score: Mapped[float]  # raw 0-100 value
+    model: Mapped[str] = mapped_column(String(10), default="stub")  # stub | cnn
+    context: Mapped[str] = mapped_column(String(12), default="routine")  # routine|post_clean|manual
+    severity_pct: Mapped[float | None]  # calibrated severity (B4); None until calibrated
     timestamp: Mapped[datetime] = ts_col()
 
 
 class SoilingEvent(Base):
     __tablename__ = "soiling_events"
     id: Mapped[int] = mapped_column(primary_key=True)
-    combined_loss: Mapped[float]
-    electrical_loss: Mapped[float]
+    combined_loss: Mapped[float | None]  # None when no loss figure exists (see reason)
+    electrical_loss: Mapped[float | None]
     cnn_severity: Mapped[float | None]
-    alert_level: Mapped[str]  # ok | watch | clean_recommended | critical
+    alert_level: Mapped[str]  # ok | watch | clean_recommended | critical | unknown
     action: Mapped[str]  # none | notify | clean | defer | wait
+    net_benefit_inr: Mapped[float | None]  # A7
+    reason: Mapped[str | None]  # why this action / state (insufficient_light, cooldown, ...)
     timestamp: Mapped[datetime] = ts_col()
 
 
@@ -64,4 +69,26 @@ class CleaningCycle(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pre_loss: Mapped[float]
     post_loss: Mapped[float | None]
-    result: Mapped[str | None]  # success | insufficient
+    result: Mapped[str | None]  # success | insufficient | failed
+    attempt: Mapped[int] = mapped_column(default=1)  # 1 or 2 (one retry)
+    post_image_id: Mapped[int | None]
+
+
+class Alert(Base):
+    """Written only on transitions (level change, cleaning, device, sensor fault)."""
+
+    __tablename__ = "alerts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = ts_col()
+    kind: Mapped[str] = mapped_column(String(20))  # level_change|cleaning|device|sensor_fault
+    level: Mapped[str] = mapped_column(String(20))
+    message: Mapped[str]
+    cycle_id: Mapped[int | None]
+
+
+class DeviceState(Base):
+    __tablename__ = "device_state"
+    source: Mapped[str] = mapped_column(String(10), primary_key=True)  # test | reference
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    healthy: Mapped[bool] = mapped_column(Boolean, default=True)
+    fault: Mapped[str | None]

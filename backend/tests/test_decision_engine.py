@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 
 import pytest
+from app import alerts as alerts_mod
 from app import decision_engine as de
 from app.config import settings
 from app.decision_engine import decide
@@ -30,7 +31,7 @@ def test_decide(loss, rain, active, level, action):
 
 def test_electrical_loss():
     assert electrical_loss_pct(8.0, 10.0) == pytest.approx(20.0)
-    assert electrical_loss_pct(0.0, 0.01) == 0.0  # night guard
+    assert electrical_loss_pct(0.0, 0.01) is None  # night: unknown, not 0% loss
     assert electrical_loss_pct(11.0, 10.0) == 0.0  # never negative
     assert electrical_loss_pct(4.0, 5.0, baseline=0.8) == pytest.approx(0.0)  # baseline absorbed
 
@@ -68,7 +69,7 @@ def add_readings(db, test_w, ref_w, n=5, age_s=0):
 def quiet(monkeypatch):
     alerts = []
     monkeypatch.setattr(de, "max_rain_probability_24h", lambda: None)
-    monkeypatch.setattr(de, "notify", alerts.append)
+    monkeypatch.setattr(alerts_mod, "notify", alerts.append)
     monkeypatch.setattr(settings, "settle_s", 0)
     return alerts
 
@@ -114,7 +115,7 @@ def test_stale_cycle_is_expired(db, quiet):
     db.add(old)
     db.commit()
     de.expire_stale_cycles(db)
-    assert (old.status, old.result) == ("complete", "insufficient")
+    assert (old.status, old.result) == ("complete", "failed")  # A8: a timeout is failed
     assert de.active_cycle(db) is None
 
 
