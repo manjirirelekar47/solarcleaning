@@ -7,6 +7,4 @@ pydantic-settings
 httpx
 python-multipart
 pillow
-pytest
-ruff
-black
+numpy

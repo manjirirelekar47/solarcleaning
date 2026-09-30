@@ -1,46 +1,34 @@
+import os
+
+os.environ["DB_URL"] = "sqlite:///:memory:"  # must be set before the app is imported
+os.environ["ENABLE_BACKGROUND"] = "0"
+
 import pytest
 from app import models  # noqa: F401
-from app.db import Base, get_db
-from app.main import app
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from app.db import Base, SessionLocal, engine
 
 
 @pytest.fixture(autouse=True)
-def no_debounce_by_default(monkeypatch):
-    """Existing tests expect an immediate clean; A4 tests set confirm_n explicitly."""
-    from app.config import settings
-
-    monkeypatch.setattr(settings, "confirm_n", 1)
-
-
-@pytest.fixture()
-def session_factory():
-    engine = create_engine(
-        "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
-    )
+def fresh_db():
+    Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False)
+    yield
 
 
-@pytest.fixture()
-def db(session_factory):
-    with session_factory() as s:
-        yield s
+@pytest.fixture
+def db():
+    with SessionLocal() as session:
+        yield session
 
 
-@pytest.fixture()
-def client(session_factory, tmp_path, monkeypatch):
-    from app.config import settings
+class FakeMqtt:
+    def __init__(self):
+        self.published = []
 
-    monkeypatch.setattr(settings, "image_dir", tmp_path)
+    def publish(self, topic, payload, qos=0):
+        self.published.append((topic, payload, qos))
 
-    def override():
-        with session_factory() as s:
-            yield s
 
-    app.dependency_overrides[get_db] = override
-    yield TestClient(app)  # no `with`: lifespan (MQTT, scheduler) is not started in tests
-    app.dependency_overrides.clear()
+@pytest.fixture
+def fake_mqtt():
+    return FakeMqtt()

@@ -1,167 +1,83 @@
 /*
- * Solar soiling edge node (ESP32)
- * Pins: INA219 x2 on I2C (SDA 21, SCL 22; test = 0x40, reference = 0x41 via A0 bridge)
- *       DHT11 data GPIO 4, cleaning relay GPIO 26 (active HIGH)
- * MQTT: publishes sensors/test, sensors/reference, sensors/fault;
- *       listens cleaning/trigger; publishes cleaning/status (running -> done | rejected)
- *
- * Safety rules (A2):
- *  - the relay timeout is checked first in loop() and never depends on the network
- *  - Wi-Fi/MQTT reconnect is non-blocking, and is not attempted while the pump runs
- *  - duration_s is clamped to MAX_CLEAN_S; a trigger while spraying is refused
- *  - a missing INA219 is reported on sensors/fault instead of publishing zeros
+ * ESP32 soiling node. Pins: I2C SDA 21 / SCL 22 (INA219 test @0x40, reference @0x41 with A0 bridged),
+ * DHT11 data GPIO 4, relay input GPIO 26 (pump/wiper).
+ * MQTT contract: publishes sensors/test + sensors/reference, listens on cleaning/trigger,
+ * reports cleaning/status ("running", then "done").
  */
-#include <Adafruit_INA219.h>
-#include <ArduinoJson.h>
-#include <DHT.h>
-#include <PubSubClient.h>
 #include <WiFi.h>
-#include <Wire.h>
-
+#include <PubSubClient.h>
+#include <Adafruit_INA219.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
 #include "secrets.h"
 
 const int RELAY_PIN = 26;
-const int MAX_CLEAN_S = 60;                    // hard ceiling, whatever the payload says
-const unsigned long SENSOR_PERIOD_MS = 2000;
-const unsigned long FAULT_PERIOD_MS = 10000;   // also retries ina.begin()
-const unsigned long WIFI_RETRY_MS = 5000;
-const unsigned long MQTT_RETRY_MS = 2000;
 
 Adafruit_INA219 inaTest(0x40), inaRef(0x41);
-bool testOk = false, refOk = false;
 DHT dht(4, DHT11);
 WiFiClient net;
 PubSubClient mqtt(net);
-
-long cycleId = -1;            // cycle currently spraying, -1 = idle
+long cycleId = -1;
 unsigned long cleanUntil = 0;
-long pendingDoneId = -1;      // "done" that could not be sent yet (link was down)
-
-void publishJson(const char* topic, JsonDocument& doc) {
-  if (!mqtt.connected()) return;
-  char buf[160];
-  size_t n = serializeJson(doc, buf, sizeof buf);
-  mqtt.publish(topic, reinterpret_cast<const uint8_t*>(buf), n, false);
-}
-
-bool publishStatus(long id, const char* state) {
-  if (!mqtt.connected()) return false;
-  JsonDocument doc;
-  doc["cycle_id"] = id;
-  doc["state"] = state;
-  publishJson("cleaning/status", doc);
-  return true;
-}
-
-void publishFault(const char* source, const char* fault) {
-  JsonDocument doc;
-  doc["source"] = source;
-  doc["fault"] = fault;
-  publishJson("sensors/fault", doc);
-}
-
-void relayOff() { digitalWrite(RELAY_PIN, LOW); }
-
-// Highest priority in loop(): must run even with no Wi-Fi, no MQTT, no sensors.
-void checkRelayTimeout() {
-  if (cycleId >= 0 && (long)(millis() - cleanUntil) >= 0) {  // rollover-safe
-    relayOff();
-    pendingDoneId = cycleId;
-    cycleId = -1;
-  }
-}
 
 void onMessage(char* topic, byte* payload, unsigned int len) {
   JsonDocument doc;
   if (deserializeJson(doc, payload, len)) return;
-  long id = doc["cycle_id"] | -1L;
-  int dur = doc["duration_s"] | 0;
-  if (id < 0) return;
-  if (cycleId >= 0) {  // already spraying
-    if (id != cycleId) publishStatus(id, "rejected");  // same id = duplicate delivery: ignore
-    return;
-  }
-  if (dur <= 0) {  // missing or invalid duration: never guess, never spray
-    publishStatus(id, "rejected");
-    return;
-  }
-  if (dur > MAX_CLEAN_S) dur = MAX_CLEAN_S;
-  cycleId = id;
-  cleanUntil = millis() + 1000UL * (unsigned long)dur;
+  cycleId = doc["cycle_id"];
+  cleanUntil = millis() + 1000UL * doc["duration_s"].as<int>();
   digitalWrite(RELAY_PIN, HIGH);
-  publishStatus(id, "running");
+  char b[64];
+  snprintf(b, sizeof b, "{\"cycle_id\":%ld,\"state\":\"running\"}", cycleId);
+  mqtt.publish("cleaning/status", b);
 }
 
-// Returns false (and publishes nothing) if the sensor is missing.
-bool publishPanel(const char* source, const char* topic, Adafruit_INA219& ina, bool& ok,
-                  float t, float h) {
-  if (!ok) return false;
-  JsonDocument doc;
-  doc["v"] = ina.getBusVoltage_V() + ina.getShuntVoltage_mV() / 1000.0;
-  doc["i_ma"] = ina.getCurrent_mA();
-  if (!isnan(t)) doc["temp"] = t;  // omit instead of sending invalid "nan" JSON
-  if (!isnan(h)) doc["hum"] = h;
-  publishJson(topic, doc);
-  return true;
+void publishPanel(const char* topic, Adafruit_INA219& ina, float t, float h) {
+  float v = ina.getBusVoltage_V() + ina.getShuntVoltage_mV() / 1000.0;
+  char b[128];
+  snprintf(b, sizeof b, "{\"v\":%.2f,\"i_ma\":%.1f,\"temp\":%.1f,\"hum\":%.1f}", v, ina.getCurrent_mA(), t, h);
+  mqtt.publish(topic, b);
 }
 
-// Non-blocking: one short step per call, rate-limited. Skipped while the pump runs.
-void maintainConnection() {
-  static unsigned long lastWifi = 0, lastMqtt = 0;
-  static bool wifiStarted = false;
-  if (cycleId >= 0) return;  // never let a slow connect delay relay-off
+void ensureConnected() {
   if (WiFi.status() != WL_CONNECTED) {
-    if (!wifiStarted || millis() - lastWifi > WIFI_RETRY_MS) {
-      wifiStarted = true;
-      lastWifi = millis();
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
-    }
-    return;
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED) delay(300);
   }
-  if (!mqtt.connected() && millis() - lastMqtt > MQTT_RETRY_MS) {
-    lastMqtt = millis();
-    if (mqtt.connect("esp32-solar")) mqtt.subscribe("cleaning/trigger", 1);
+  while (!mqtt.connected()) {
+    bool ok = (strlen(MQTT_USER) > 0) ? mqtt.connect("esp32-solar", MQTT_USER, MQTT_PASS)
+                                       : mqtt.connect("esp32-solar");
+    if (ok) mqtt.subscribe("cleaning/trigger", 1);
+    else delay(2000);
   }
 }
 
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
-  relayOff();
-  Wire.begin(21, 22);
-  testOk = inaTest.begin();
-  refOk = inaRef.begin();
+  digitalWrite(RELAY_PIN, LOW);
+  inaTest.begin();
+  inaRef.begin();
   dht.begin();
   mqtt.setServer(MQTT_HOST, 1883);
-  mqtt.setSocketTimeout(2);  // seconds; bounds any connect attempt
   mqtt.setCallback(onMessage);
 }
 
 void loop() {
-  checkRelayTimeout();
-  maintainConnection();
+  ensureConnected();
   mqtt.loop();
-  checkRelayTimeout();  // mqtt.loop() may have taken a moment
-
-  if (pendingDoneId >= 0 && publishStatus(pendingDoneId, "done")) pendingDoneId = -1;
-
-  static unsigned long lastSensor = 0, lastFault = 0;
-  if (millis() - lastSensor > SENSOR_PERIOD_MS) {
-    lastSensor = millis();
+  static unsigned long last = 0;
+  if (millis() - last > 2000) {
+    last = millis();
     float t = dht.readTemperature(), h = dht.readHumidity();
-    publishPanel("test", "sensors/test", inaTest, testOk, t, h);
-    publishPanel("reference", "sensors/reference", inaRef, refOk, t, h);
+    if (isnan(t)) t = 0;  // DHT11 occasionally fails a read; keep the JSON valid
+    if (isnan(h)) h = 0;
+    publishPanel("sensors/test", inaTest, t, h);
+    publishPanel("sensors/reference", inaRef, t, h);
   }
-  if (millis() - lastFault > FAULT_PERIOD_MS) {
-    lastFault = millis();
-    if (!testOk) {
-      publishFault("test", "ina219_not_found");
-      testOk = inaTest.begin();  // pick it up if it was plugged in late
-    }
-    if (!refOk) {
-      publishFault("reference", "ina219_not_found");
-      refOk = inaRef.begin();
-    }
+  if (cycleId >= 0 && millis() > cleanUntil) {
+    digitalWrite(RELAY_PIN, LOW);
+    char b[64];
+    snprintf(b, sizeof b, "{\"cycle_id\":%ld,\"state\":\"done\"}", cycleId);
+    mqtt.publish("cleaning/status", b);
+    cycleId = -1;
   }
-  checkRelayTimeout();
 }

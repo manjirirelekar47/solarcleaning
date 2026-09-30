@@ -5,19 +5,18 @@ on:
     branches: [main]
 
 jobs:
-  backend:
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
-      - run: pip install -r backend/requirements.txt
-      - run: ruff check .
-      - run: black --check .
-      - run: pytest
+      - run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - run: ruff check backend ml tools
+      - run: black --check backend ml tools
+      - run: pytest -q          # backend + ml splits + tools (torch is not needed)
 
   dashboard:
     runs-on: ubuntu-latest

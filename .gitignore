@@ -4,9 +4,13 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 
 # Secrets / local config
 .env
+infra/mosquitto/passwd
+firmware/include/secrets.h
+dashboard/.env.local
 
 # Runtime data
 backend/storage/*
@@ -15,8 +19,9 @@ backend/storage/images/*
 !backend/storage/images/.gitkeep
 ml/data/*
 !ml/data/.gitkeep
-ml/artifacts/*
-!ml/artifacts/.gitkeep
+!ml/data/README.md
+# model weights are not committed; report.txt and severity_map.json are
+ml/models/*.pt
 
 # Node
 node_modules/
@@ -29,6 +34,3 @@ firmware/.pio/
 .DS_Store
 .vscode/
 .idea/
-
-# Firmware credentials
-firmware/include/secrets.h

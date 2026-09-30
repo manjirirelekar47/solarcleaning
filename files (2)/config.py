@@ -1,0 +1,52 @@
+"""Application settings, loaded from the repo-root .env (works from any working directory)."""
+
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = BACKEND_DIR.parent
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", extra="ignore")
+
+    mqtt_broker_host: str = "localhost"
+    mqtt_port: int = 1883
+    db_url: str = "postgresql+psycopg://solar:solar@localhost:5432/solar"
+    weather_lat: float = 0.0
+    weather_lon: float = 0.0
+    baseline_ratio: float = 1.0
+    eval_interval_s: int = 10
+    settle_s: int = 20
+    rain_threshold_pct: int = 60
+    clean_duration_s: int = 20
+    cycle_timeout_s: int = 300  # stale-cycle guard (backend restarts, dead edge device)
+    # --- A1: cleaning limits ---
+    min_clean_interval_s: int = 600  # cooldown between auto-cleans (measured from trigger time)
+    max_cleans_per_day: int = 6  # rolling 24 h cap on cleaning cycles
+    # --- A3: device health and sensor sanity ---
+    offline_after_s: int = 30  # no reading from a source for this long -> offline
+    max_panel_v: float = 26.0  # INA219 bus-voltage ceiling; above this the reading is bogus
+    min_panel_current_a: float = -0.05  # below this (negative) the reading is bogus
+    dead_test_ratio: float = 0.02  # test power below this fraction of reference = dead sensor
+    # --- A4/A5: debounce and loss estimate (added in S1, used later) ---
+    confirm_n: int = 3  # consecutive evaluations above threshold before auto-clean
+    min_ref_power_w: float = 0.05  # below this the reference gives no usable light signal
+    temp_coeff: float = 0.0  # power temperature coefficient per deg C (e.g. -0.004); 0 = off
+    # --- A7: cost-benefit (demo values; scale to the real plant for the slide) ---
+    tariff_inr_per_kwh: float = 8.0
+    plant_kwp: float = 1000.0
+    peak_sun_hours: float = 5.0
+    water_cost_per_clean: float = 50.0
+    pump_w: float = 30.0
+    labor_cost_per_clean: float = 0.0
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    cors_origins: str = "http://localhost:5173"
+    image_dir: Path = BACKEND_DIR / "storage" / "images"
+    model_path: Path = ROOT_DIR / "ml" / "artifacts" / "soiling_mnv3.pt"
+    classes_path: Path = ROOT_DIR / "ml" / "artifacts" / "classes.json"
+
+
+settings = Settings()

@@ -1,412 +1,228 @@
-"""Automation brain: combined loss -> decision -> cleaning trigger -> post-clean verification."""
+"""The automation brain: combine signals, decide, trigger cleaning, verify the result.
+
+decide() is a pure function so the threshold table is trivially testable.
+"""
 
 import json
 import statistics
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
-from . import economics, health
-from .alerts import record_alert
 from .config import settings
-from .loss import baseline_at, combined_loss, paired_electrical_loss
+from .loss import combined_loss, electrical_loss_pct
 from .models import (
-    Alert,
     CleaningCycle,
+    DeviceState,
     ImageCapture,
     PanelReading,
     SoilingEvent,
-    aware,
     now,
 )
+from .notify import raise_alert
 from .weather import max_rain_probability_24h
 
-CONFIRMING = "confirming"  # A4: wants to clean, waiting for confirm_n evaluations
-INSPECTION = "manual_inspection"  # A8: auto-clean stops until a human looks (or the panel is ok)
+MIN_SAMPLES = 3
 
 
 @dataclass
 class Decision:
     level: str
     action: str
+    reason: str = ""
 
 
-# A4: level ladder. Rising is immediate; falling needs loss to clear the threshold by
-# `hysteresis_pct`, so a loss hovering at 5/10/20% does not flap between levels.
-LEVELS = ("ok", "watch", "clean_recommended", "critical")
-LEVEL_THRESHOLDS = (5.0, 10.0, 20.0)  # loss % at which levels 1, 2, 3 begin
-
-
-def level_index(loss: float) -> int:
-    return sum(loss >= t for t in LEVEL_THRESHOLDS)
-
-
-def held_level(loss: float, prev_level: str | None) -> str:
-    """Alert level for `loss`, sticky on the way down (A4 hysteresis)."""
-    idx = level_index(loss)
-    prev = LEVELS.index(prev_level) if prev_level in LEVELS else 0
-    if prev > idx:
-        idx = prev
-        while idx > 0 and loss < LEVEL_THRESHOLDS[idx - 1] - settings.hysteresis_pct:
-            idx -= 1
-    return LEVELS[idx]
-
-
-def decide(
-    loss: float, rain_prob: int | None, cleaning_active: bool, prev_level: str | None = None
-) -> Decision:
-    """Hysteresis shapes the reported level only. The ACTION always follows the raw
-    thresholds, so a held level can never trigger a clean below its threshold."""
-    level = held_level(loss, prev_level)
+def decide(loss: float, rain_prob: int | None, cleaning_active: bool) -> Decision:
     if loss < 5:
-        return Decision(level, "none")
+        return Decision("ok", "none", f"loss {loss:.1f}% is below 5%")
     if loss < 10:
-        return Decision(level, "notify")
+        return Decision("watch", "notify", f"loss {loss:.1f}% is in the 5-10% watch band")
     if loss < 20:
         if rain_prob is not None and rain_prob >= settings.rain_threshold_pct:
-            return Decision(level, "defer")
-        return Decision(level, "wait" if cleaning_active else "clean")
-    return Decision(level, "wait" if cleaning_active else "clean")
-
-
-def median_power(db, panel: str, minutes: int = 5, since=None, min_samples: int = 1):
-    """Median power over the last `minutes`, or over everything since `since` if given."""
-    since = since or now() - timedelta(minutes=minutes)
-    vals = db.scalars(
-        select(PanelReading.power).where(
-            PanelReading.panel_type == panel, PanelReading.timestamp >= since
-        )
-    ).all()
-    return statistics.median(vals) if len(vals) >= min_samples else None
-
-
-def recent_power(db, panel: str, n: int = 3):
-    """Median of the last n raw readings (None if fewer). Catches a sensor that just died,
-    which the 5-minute median hides while it is still a mix of good and zero samples."""
-    vals = db.scalars(
-        select(PanelReading.power)
-        .where(PanelReading.panel_type == panel)
-        .order_by(PanelReading.timestamp.desc(), PanelReading.id.desc())
-        .limit(n)
-    ).all()
-    return statistics.median(vals) if len(vals) >= n else None
-
-
-def panel_medians(db, since=None, min_samples: int = 1):
-    t = median_power(db, "test", since=since, min_samples=min_samples)
-    r = median_power(db, "reference", since=since, min_samples=min_samples)
-    return t, r
-
-
-def paired_samples(db, since):
-    rows = db.execute(
-        select(
-            PanelReading.panel_type, PanelReading.timestamp, PanelReading.power, PanelReading.temp
-        ).where(PanelReading.timestamp >= since)
-    ).all()
-    by = {"test": [], "reference": []}
-    for panel, ts, power, temp in rows:
-        by[panel].append((aware(ts), power, temp))
-    return by["test"], by["reference"]
-
-
-def current_electrical_loss(db, since=None, min_samples: int = 1):
-    """A5: median of per-pair test/reference ratios since `since` (default: last 5 minutes).
-    None when there is no data OR no usable light (night); never a fake 0."""
-    since = since or now() - timedelta(minutes=5)
-    test, ref = paired_samples(db, since)
-    return paired_electrical_loss(test, ref, baseline_at(now()), min_pairs=min_samples)
-
-
-def active_cycle(db):
-    return db.scalars(select(CleaningCycle).where(CleaningCycle.status != "complete")).first()
-
-
-def latest_cycle(db):
-    return db.scalars(select(CleaningCycle).order_by(CleaningCycle.id.desc())).first()
-
-
-def _ok_since(db, ts) -> bool:
-    return bool(
-        db.scalar(
-            select(func.count())
-            .select_from(SoilingEvent)
-            .where(SoilingEvent.alert_level == "ok", SoilingEvent.timestamp > aware(ts))
-        )
-    )
-
-
-def next_attempt(db) -> int:
-    """A8: the clean after an 'insufficient' first attempt is the one allowed retry (attempt 2).
-
-    The retry is not a special path: it is the next clean the engine would do anyway, so the
-    cooldown, daily cap, device health, both signal gates and rain deferral all still apply.
-    A recovery to 'ok' in between, or a long gap, starts a fresh incident (attempt 1).
-    """
-    last = latest_cycle(db)
-    if last is None or last.status != "complete" or last.result != "insufficient":
-        return 1
-    if last.attempt != 1 or last.completed_at is None:
-        return 1
-    if now() - aware(last.completed_at) > timedelta(seconds=settings.retry_window_s):
-        return 1
-    return 1 if _ok_since(db, last.completed_at) else 2
-
-
-def inspection_hold(db) -> bool:
-    """A8: after a 'manual inspection needed' alert the pump stays off until the panel reads ok
-    again or someone starts a cleaning by hand (a cycle newer than the alert)."""
-    alert = db.scalars(
-        select(Alert)
-        .where(Alert.kind == "cleaning", Alert.level == "inspection")
-        .order_by(Alert.id.desc())
-    ).first()
-    if alert is None:
-        return False
-    cyc = latest_cycle(db)
-    if cyc is not None and aware(cyc.triggered_at) > aware(alert.timestamp):
-        return False
-    return not _ok_since(db, alert.timestamp)
-
-
-def trigger_clean(db, mqtt, pre_loss: float, attempt: int | None = None) -> CleaningCycle:
-    attempt = next_attempt(db) if attempt is None else attempt
-    cyc = CleaningCycle(pre_loss=pre_loss, attempt=attempt)
-    db.add(cyc)
-    db.commit()
-    payload = {"cycle_id": cyc.id, "duration_s": settings.clean_duration_s}
-    mqtt.publish("cleaning/trigger", json.dumps(payload), qos=1)
-    record_alert(
-        db,
-        "cleaning",
-        "info",
-        f"Cleaning #{cyc.id} started (attempt {attempt}), loss {pre_loss:.1f}%",
-        cycle_id=cyc.id,
-    )
-    return cyc
-
-
-def expire_stale_cycles(db) -> None:
-    """A cycle stuck in triggered/running/verifying would block all future cleaning.
-    A8: a timeout is 'failed' (we never learned the outcome), not 'insufficient'."""
-    limit = timedelta(seconds=settings.cycle_timeout_s)
-    for cyc in db.scalars(select(CleaningCycle).where(CleaningCycle.status != "complete")):
-        if now() - aware(cyc.triggered_at) > limit:
-            cyc.status, cyc.result, cyc.completed_at = "complete", "failed", now()
-            db.commit()
-            record_alert(
-                db,
-                "cleaning",
-                "inspection",
-                f"Cleaning #{cyc.id} timed out without verification (failed). "
-                "Manual inspection needed.",
-                cycle_id=cyc.id,
+            return Decision(
+                "clean_recommended",
+                "defer",
+                f"loss {loss:.1f}%, cleaning deferred: {rain_prob}% chance of rain in 24 h",
             )
+        act = "wait" if cleaning_active else "clean"
+        return Decision("clean_recommended", act, f"loss {loss:.1f}% is at or above 10%")
+    act = "wait" if cleaning_active else "clean"
+    return Decision("critical", act, f"loss {loss:.1f}% is at or above 20% (rain is ignored)")
 
 
-def last_completed_cycle(db):
+def net_benefit_inr(loss_pct: float) -> float:
+    """Value of the energy a clean panel would recover over the horizon, minus cleaning cost.
+
+    Informational only: the thresholds in decide() drive the action.
+    """
+    saved_kwh = (
+        loss_pct / 100 * settings.farm_rated_kw * settings.peak_sun_hours
+    ) * settings.benefit_horizon_days
+    return round(saved_kwh * settings.tariff_inr_per_kwh - settings.cleaning_cost_inr, 2)
+
+
+def last_cleaning_completed(db) -> datetime | None:
     return db.scalars(
-        select(CleaningCycle)
+        select(CleaningCycle.completed_at)
         .where(CleaningCycle.completed_at.is_not(None))
         .order_by(CleaningCycle.completed_at.desc())
     ).first()
 
 
-def clean_block_reason(db) -> str | None:
-    """A1: cooldown since the last trigger, and a rolling 24 h cap. None = cleaning allowed."""
-    last = db.scalars(select(CleaningCycle).order_by(CleaningCycle.triggered_at.desc())).first()
-    if last and now() - aware(last.triggered_at) < timedelta(seconds=settings.min_clean_interval_s):
-        return "cooldown"
-    day_ago = now() - timedelta(hours=24)
-    n = db.scalar(
-        select(func.count()).select_from(CleaningCycle).where(CleaningCycle.triggered_at >= day_ago)
-    )
-    if n >= settings.max_cleans_per_day:
-        return "daily_cap"
-    return None
-
-
-def confirm_streak(db) -> int:
-    """A4: consecutive prior evaluations that wanted to clean but were still confirming.
-
-    Derived from the event log (no extra state, survives restarts). A gap longer than three
-    evaluation intervals breaks the streak, so a stale run cannot carry over an outage.
-    """
-    max_gap = timedelta(seconds=3 * settings.eval_interval_s)
-    streak, newer = 0, now()
-    for ev in db.scalars(select(SoilingEvent).order_by(SoilingEvent.timestamp.desc()).limit(50)):
-        if ev.reason != CONFIRMING or newer - aware(ev.timestamp) > max_gap:
-            break
-        streak, newer = streak + 1, aware(ev.timestamp)
-    return streak
-
-
-def _record_state(db, prev, reason: str, alert_msg: str | None = None) -> None:
-    """Loss is unknown (night, sensor fault, device down): store ONE event per state change."""
-    if prev is not None and prev.reason == reason:
-        return
-    db.add(
-        SoilingEvent(
-            combined_loss=None,
-            electrical_loss=None,
-            cnn_severity=None,
-            alert_level="unknown",
-            action="none",
-            reason=reason,
+def median_power(db, panel: str, since: datetime) -> float | None:
+    vals = db.scalars(
+        select(PanelReading.power).where(
+            PanelReading.panel_type == panel, PanelReading.timestamp >= since
         )
+    ).all()
+    return statistics.median(vals) if len(vals) >= MIN_SAMPLES else None
+
+
+def electrical_loss_since(db, since: datetime) -> float | None:
+    t, r = median_power(db, "test", since), median_power(db, "reference", since)
+    return None if t is None or r is None else electrical_loss_pct(t, r, settings.baseline_ratio)
+
+
+def current_electrical_loss(db) -> float | None:
+    """5-minute median, but never reaching back before the last completed cleaning
+    (otherwise pre-clean readings would keep the loss high and cause a cleaning loop)."""
+    since = now() - timedelta(minutes=5)
+    done = last_cleaning_completed(db)
+    return electrical_loss_since(db, max(since, done) if done else since)
+
+
+def cleaning_is_active(db) -> bool:
+    return (
+        db.scalars(select(CleaningCycle).where(CleaningCycle.status != "complete")).first()
+        is not None
     )
+
+
+def trigger_clean(db, mqtt, pre_loss: float) -> CleaningCycle:
+    cyc = CleaningCycle(pre_loss=pre_loss)
+    db.add(cyc)
     db.commit()
-    if alert_msg:
-        record_alert(db, "sensor_fault", "critical", alert_msg)
-
-
-def severity_to_loss_pct(img) -> float:
-    """Expected power loss (%) implied by the image. Calibrated value if B4 provided one,
-    otherwise the raw 0-100 index scaled by severity_loss_factor (an index, not a measurement)."""
-    if img.severity_pct is not None:
-        return img.severity_pct
-    return img.severity_score * settings.severity_loss_factor
-
-
-def signal_hold_reason(elec: float, img, fresh: bool, net: float) -> str | None:
-    """A6/A7 gates: both signals must agree, and cleaning must pay. None = go ahead."""
-    if elec < settings.gate_electrical_pct:
-        return "cnn_only"  # image says dirty, the meter does not: notify, do not spray
-    if fresh and img.soiling_class == "clean":
-        return "electrical_only"  # meter says loss, image says clean: shadow / cloud edge
-    if net <= 0:
-        return "cost_exceeds_benefit"
-    return None
-
-
-def evaluate_once(db, mqtt) -> None:
-    prev = db.scalars(select(SoilingEvent).order_by(SoilingEvent.timestamp.desc())).first()
-
-    # A3: a dead or offline device must never lead to a clean.
-    if health.evaluate_health(db):
-        _record_state(db, prev, "device_unhealthy")
-        return
-
-    # A1: only data taken after the last cycle has settled may count.
-    start, cutoff = now() - timedelta(minutes=5), None
-    last = last_completed_cycle(db)
-    if last is not None:
-        cutoff = aware(last.completed_at) + timedelta(seconds=settings.settle_s)
-        start = max(start, cutoff)
-
-    t, r = panel_medians(db, since=start, min_samples=3)
-    if t is None or r is None:  # nothing usable yet (settling after a clean, or no data)
-        return
-    fault = health.cross_check(t, r)
-    rt, rr = recent_power(db, "test"), recent_power(db, "reference")
-    if not fault and rt is not None and rr is not None:
-        fault = health.cross_check(rt, rr)
-    if fault:
-        _record_state(db, prev, "sensor_fault", f"Sensor fault: {fault}. Auto-clean paused.")
-        return
-    elec = current_electrical_loss(db, since=start, min_samples=3)
-    if elec is None:  # reference too dark (or no test/reference pairs) to compare
-        _record_state(db, prev, "insufficient_light")
-        return
-
-    img = db.scalars(select(ImageCapture).order_by(ImageCapture.timestamp.desc())).first()
-    fresh = img is not None and now() - aware(img.timestamp) < timedelta(hours=24)
-    if fresh and cutoff is not None and aware(img.timestamp) <= cutoff:
-        fresh = False  # image predates the last clean: a new one is required
-    sev = (
-        (img.severity_pct if img.severity_pct is not None else img.severity_score)
-        if fresh
-        else None
+    mqtt.publish(
+        "cleaning/trigger",
+        json.dumps({"cycle_id": cyc.id, "duration_s": settings.clean_duration_s}),
+        qos=1,
     )
-    loss = combined_loss(severity_to_loss_pct(img) if fresh else None, elec)
-    rain = max_rain_probability_24h()
-    prev_level = prev.alert_level if prev else "ok"
-    d = decide(loss, rain, active_cycle(db) is not None, prev_level)
-    net = economics.net_benefit_inr(loss, rain)
+    return cyc
 
-    reason = None
-    if d.action == "clean":
-        reason = signal_hold_reason(elec, img, fresh, net)
-        if reason:
-            d = Decision(d.level, "notify")  # a human decides; the pump stays off
-        elif inspection_hold(db):  # A8: a human must look before the pump runs again
-            d, reason = Decision(d.level, "notify"), INSPECTION
-        else:
-            reason = clean_block_reason(db)
-            if reason:
-                d = Decision(d.level, "wait")
-            elif confirm_streak(db) + 1 < settings.confirm_n:  # A4: not yet confirmed
-                d, reason = Decision(d.level, "wait"), CONFIRMING
 
+def latest_image_severity(db) -> float | None:
+    """Severity of the newest USABLE image from the last 24 h taken AFTER the last cleaning.
+
+    Images flagged used=False (stub model, low confidence, dark/blank/sky frame) never count.
+    Uses the calibrated loss-% when a severity map exists, else the raw 0-100 score.
+    """
+    img = db.scalars(
+        select(ImageCapture)
+        .where(ImageCapture.used.is_(True))
+        .order_by(ImageCapture.timestamp.desc())
+    ).first()
+    if not img or now() - img.timestamp >= timedelta(hours=24):
+        return None
+    done = last_cleaning_completed(db)
+    if done and img.timestamp < done:
+        return None  # photo shows the pre-clean panel
+    return img.severity_pct if img.severity_pct is not None else img.severity_score
+
+
+def devices_unhealthy(db) -> list[str]:
+    return [d.source for d in db.scalars(select(DeviceState)).all() if not d.healthy]
+
+
+def refresh_device_health(db):
+    """Mark a source offline when it stops reporting, and alert on each transition."""
+    limit = timedelta(seconds=settings.device_timeout_s)
+    for dev in db.scalars(select(DeviceState)).all():
+        stale = dev.last_seen is None or now() - dev.last_seen > limit
+        if stale and dev.healthy:
+            dev.healthy, dev.fault = False, f"no data for more than {settings.device_timeout_s}s"
+            db.commit()
+            raise_alert(db, "device_offline", "critical", f"{dev.source} panel sensor offline")
+        elif not stale and not dev.healthy:
+            dev.healthy, dev.fault = True, None
+            db.commit()
+            raise_alert(db, "device_recovered", "ok", f"{dev.source} panel sensor is back")
+
+
+def evaluate_once(db, mqtt):
+    elec = current_electrical_loss(db)
+    if elec is None:
+        return
+    sev = latest_image_severity(db)
+    loss = combined_loss(sev, elec)
+    d = decide(loss, max_rain_probability_24h(), cleaning_is_active(db))
+
+    down = devices_unhealthy(db)
+    if d.action == "clean" and down:  # never spray on data from a dead sensor
+        d = Decision(d.level, "blocked", f"cleaning blocked: {', '.join(down)} sensor offline")
+
+    prev = db.scalars(select(SoilingEvent).order_by(SoilingEvent.timestamp.desc())).first()
     db.add(
         SoilingEvent(
             combined_loss=loss,
             electrical_loss=elec,
             cnn_severity=sev,
-            alert_level=d.level,
+            level=d.level,
             action=d.action,
-            net_benefit_inr=net,
-            reason=reason,
+            reason=d.reason,
+            net_benefit_inr=net_benefit_inr(loss),
         )
     )
     db.commit()
-    if reason not in (None, CONFIRMING, INSPECTION) and (prev is None or prev.reason != reason):
-        record_alert(
-            db,
-            "cleaning",
-            d.level,
-            f"Auto-clean held ({reason}): loss {loss:.1f}%, electrical {elec:.1f}%, "
-            f"net benefit INR {net:,.0f}",
-        )
-    if d.level != prev_level and not (prev_level == "unknown" and d.level == "ok"):
-        record_alert(
+    if d.action == "clean":
+        trigger_clean(db, mqtt, loss)
+    if d.level != (prev.level if prev else "ok"):
+        raise_alert(
             db,
             "level_change",
             d.level,
             f"Solar soiling level: {d.level} (loss {loss:.1f}%, action: {d.action})",
         )
-    if d.action == "clean":
-        trigger_clean(db, mqtt, loss)
 
 
-def verify_cycles(db) -> None:
-    """Once cleaning is done and the panel has settled, compare loss before vs after.
+def verify_cycles(db):
+    """After cleaning finishes and the panel has settled, compare loss before vs after.
 
-    Only readings taken AFTER the settle window count; a plain 5-minute median would still
-    contain pre-clean (dirty) readings and report every cleaning as insufficient.
-    A8: a post-clean image (context 'post_clean', B3) taken after the spray is fused with the
-    electrical loss; without one, electrical data alone decides.
+    post_loss uses electrical loss only (readings received since the cleaning finished).
     """
-    for cyc in db.scalars(select(CleaningCycle).where(CleaningCycle.status == "verifying")):
-        ready_at = aware(cyc.completed_at) + timedelta(seconds=settings.settle_s)
-        if now() < ready_at:
+    for cyc in db.scalars(select(CleaningCycle).where(CleaningCycle.status == "verifying")).all():
+        if now() - cyc.completed_at < timedelta(seconds=settings.settle_s):
             continue
-        elec = current_electrical_loss(db, since=ready_at, min_samples=3)
-        if elec is None:  # not enough post-clean data yet
+        post = electrical_loss_since(db, cyc.completed_at)
+        if post is None:
             continue
-        img = db.scalars(
-            select(ImageCapture)
-            .where(
-                ImageCapture.context == "post_clean",
-                ImageCapture.timestamp >= aware(cyc.completed_at),
-            )
-            .order_by(ImageCapture.timestamp.desc())
-        ).first()
-        post = combined_loss(severity_to_loss_pct(img) if img else None, elec)
-        cyc.post_loss, cyc.status, cyc.post_image_id = post, "complete", img.id if img else None
+        cyc.post_loss, cyc.status = post, "complete"
         cyc.result = "success" if post < 5 else "insufficient"
         db.commit()
-        change = f"{cyc.pre_loss:.1f}% -> {post:.1f}%"
-        if cyc.result == "success":
-            level, msg = "ok", f"Cleaning #{cyc.id} success: {change}"
-        elif cyc.attempt < 2:
-            level = "warning"
-            msg = f"Cleaning #{cyc.id} insufficient: {change}. One retry when the cooldown allows."
-        else:
-            level = "inspection"
-            msg = (
-                f"Cleaning #{cyc.id} still insufficient after retry: {change}. "
-                "Manual inspection needed."
-            )
-        record_alert(db, "cleaning", level, msg, cycle_id=cyc.id)
+        raise_alert(
+            db,
+            "cleaning_result",
+            "ok" if cyc.result == "success" else "watch",
+            f"Cleaning #{cyc.id} {cyc.result}: {cyc.pre_loss:.1f}% -> {post:.1f}%",
+            cyc.id,
+        )
+
+
+def expire_stale_cycles(db):
+    """Backend restart / lost MQTT message must not block cleaning forever."""
+    cutoff = now() - timedelta(seconds=settings.stale_cycle_s)
+    for cyc in db.scalars(
+        select(CleaningCycle).where(
+            CleaningCycle.status != "complete", CleaningCycle.triggered_at < cutoff
+        )
+    ).all():
+        stuck = cyc.status
+        cyc.status, cyc.result, cyc.completed_at = "complete", "insufficient", now()
+        db.commit()
+        raise_alert(
+            db,
+            "cleaning_timeout",
+            "watch",
+            f"Cleaning #{cyc.id} timed out (stuck in '{stuck}'), marked insufficient",
+            cyc.id,
+        )

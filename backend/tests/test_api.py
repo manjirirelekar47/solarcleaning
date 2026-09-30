@@ -1,79 +1,53 @@
-import io
+from app import api, mqtt_client
+from app.config import settings
+from app.main import app
+from app.models import CleaningCycle, now
+from fastapi.testclient import TestClient
 
-from app.models import Alert, CleaningCycle, PanelReading, SoilingEvent
-from PIL import Image
-
-
-def png(color):
-    buf = io.BytesIO()
-    Image.new("RGB", (64, 64), color).save(buf, "PNG")
-    return buf.getvalue()
+client = TestClient(app)  # not used as a context manager -> no MQTT / scheduler
 
 
-def test_health(client):
+def test_health():
     assert client.get("/health").json() == {"ok": True}
 
 
-def test_status_on_empty_db_does_not_crash(client):
-    r = client.get("/status")
-    assert r.status_code == 200
-    assert r.json() == {"event": None, "image": None, "env": None, "cleaning": None}
-
-
-def test_empty_list_endpoints(client):
-    for path in ("/readings", "/soiling-events", "/alerts", "/cleaning-cycles", "/images"):
+def test_empty_lists():
+    for path in ("/images", "/soiling-events", "/alerts", "/cleaning-cycles", "/device-health"):
         assert client.get(path).json() == []
     assert client.get("/decision").json() is None
+    assert client.get("/status").status_code == 200
 
 
-def test_upload_image_classifies_and_shows_in_status(client):
-    r = client.post("/images", files={"file": ("dusty.png", png("white"), "image/png")})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["class"] == "dusty" and body["severity"] > 20
-    s = client.get("/status").json()
-    assert s["image"]["url"].startswith("/media/") and s["image"]["class"] == "dusty"
-
-
-def test_upload_rejects_non_image(client):
-    r = client.post("/images", files={"file": ("x.jpg", b"not an image", "image/jpeg")})
-    assert r.status_code == 400
-
-
-def test_status_reflects_event_and_env(client, db):
-    db.add(
-        PanelReading(panel_type="reference", voltage=18, current=0.4, power=7, temp=30, humidity=45)
-    )
-    db.add(
-        SoilingEvent(
-            combined_loss=12,
-            electrical_loss=10,
-            cnn_severity=None,
-            alert_level="clean_recommended",
-            action="clean",
-        )
-    )
-    db.commit()
-    s = client.get("/status").json()
-    assert s["event"]["level"] == "clean_recommended" and s["env"]["temp"] == 30
-    assert client.get("/alerts").json() == []  # A9: an event is not an alert, only transitions are
-    db.add(Alert(kind="level_change", level="clean_recommended", message="level changed"))
-    db.commit()
-    row = client.get("/alerts").json()[0]
-    assert (row["kind"], row["level"], row["message"]) == (
-        "level_change",
-        "clean_recommended",
-        "level changed",
-    )
-
-
-def test_manual_clean_blocked_while_cycle_active(client, db, monkeypatch):
-    from app import api
-
-    sent = []
-    monkeypatch.setattr(api.mqtt_client.client, "publish", lambda *a, **k: sent.append(a))
-    assert client.post("/trigger-clean").status_code == 200
-    assert len(sent) == 1 and sent[0][0] == "cleaning/trigger"
-    assert client.post("/trigger-clean").status_code == 409
-    assert db.query(CleaningCycle).count() == 1
+def test_manual_trigger_needs_key_and_publishes(fake_mqtt, monkeypatch):
+    monkeypatch.setattr(mqtt_client, "client", fake_mqtt)
+    monkeypatch.setattr(settings, "api_key", "k")
+    assert client.post("/trigger-clean").status_code == 401
+    r = client.post("/trigger-clean", headers={"X-API-Key": "k"})
+    assert r.json()["ok"] is True
+    assert fake_mqtt.published[0][0] == "cleaning/trigger"
     assert client.get("/cleaning-cycles").json()[0]["status"] == "triggered"
+
+
+def test_manual_trigger_returns_409_while_a_cycle_is_active(db, fake_mqtt, monkeypatch):
+    monkeypatch.setattr(mqtt_client, "client", fake_mqtt)
+    monkeypatch.setattr(settings, "api_key", "k")
+    db.add(CleaningCycle(pre_loss=10, status="running", triggered_at=now()))
+    db.commit()
+    assert client.post("/trigger-clean", headers={"X-API-Key": "k"}).status_code == 409
+    assert fake_mqtt.published == []
+
+
+def test_upload_uses_uuid_filename_and_lists_image(tmp_path, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    monkeypatch.setattr(settings, "images_dir", tmp_path)
+    monkeypatch.setattr(api.vision.settings, "model_path", tmp_path / "none.pt")
+    api.vision.get_bundle(reload=True)
+    buf = io.BytesIO()
+    Image.new("RGB", (128, 128), (200, 200, 200)).save(buf, "JPEG")
+    r = client.post("/images", files={"file": ("a.jpg", buf.getvalue(), "image/jpeg")})
+    assert r.status_code == 201
+    assert len(list(tmp_path.iterdir())) == 1
+    assert client.get("/images").json()[0]["id"] == r.json()["id"]

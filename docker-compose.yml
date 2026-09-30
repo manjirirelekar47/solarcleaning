@@ -1,3 +1,5 @@
+# Default:            docker compose up -d                    -> broker + database only (local dev)
+# Whole stack:        docker compose --profile full up -d --build
 services:
   mosquitto:
     image: eclipse-mosquitto:2
@@ -11,5 +13,32 @@ services:
       POSTGRES_DB: solar
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  backend:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        WITH_ML: "0"          # set to "1" to bake torch into the image (large)
+    env_file: [.env]
+    environment:            # container-network overrides of the localhost values in .env
+      MQTT_BROKER_HOST: mosquitto
+      DB_URL: postgresql+psycopg://solar:solar@db:5432/solar
+    depends_on: [mosquitto, db]
+    ports: ["8000:8000"]
+    volumes:
+      - ./backend/storage:/app/backend/storage
+      - ./ml/models:/app/ml/models:ro
+    restart: unless-stopped
+
+  dashboard:
+    profiles: ["full"]
+    build:
+      context: ./dashboard
+      args:
+        VITE_API_URL: http://localhost:8000   # the BROWSER calls the API, so use the host address
+    depends_on: [backend]
+    ports: ["8080:80"]
 volumes:
   pgdata:
